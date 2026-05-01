@@ -14,9 +14,20 @@ ALLOWED_PREFIXES = {
     "today.uci.edu": "/department/information_computer_sciences/",
 }
 
+UNIQUE_PAGES_FILE = "unique_pages.txt"
+
 def scraper(url, resp):
+    record_unique_page(url, resp)
+
     links = extract_next_links(url, resp)
-    return [link for link in links if is_valid(link)]
+
+    valid_links = []
+
+    for link in links:
+        if isinstance(link, str) and is_valid(link):
+            valid_links.append(link)
+
+    return valid_links
 
 def extract_next_links(url, resp):
     # Implementation required.
@@ -258,3 +269,67 @@ def is_valid(url):
 
     except (TypeError, ValueError):
         return False
+
+def record_unique_page(url, resp):
+    """
+    Records each successfully crawled unique page.
+
+    Uniqueness is based only on the URL after removing the fragment.
+    Example:
+    http://www.ics.uci.edu#aaa
+    http://www.ics.uci.edu#bbb
+
+    Both count as:
+    http://www.ics.uci.edu
+    """
+    if resp is None:
+        return
+
+    if resp.status != 200:
+        return
+
+    if resp.raw_response is None:
+        return
+
+    if resp.raw_response.content is None:
+        return
+
+    if len(resp.raw_response.content) == 0:
+        return
+
+    final_url = resp.raw_response.url if resp.raw_response.url else url
+
+    # Remove fragment
+    final_url, _ = urldefrag(final_url)
+    final_url = final_url.strip()
+
+    if not final_url:
+        return
+
+    # Only count pages that your crawler considers valid
+    if not is_valid(final_url):
+        return
+
+    # Load existing unique URLs
+    unique_urls = set()
+
+    try:
+        with open(UNIQUE_PAGES_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                existing_url = line.strip()
+                if existing_url:
+                    unique_urls.add(existing_url)
+    except FileNotFoundError:
+        pass
+
+    # Add current page
+    unique_urls.add(final_url)
+
+    # Rewrite file in sorted order so it stays clean
+    with open(UNIQUE_PAGES_FILE, "w", encoding="utf-8") as f:
+        for unique_url in sorted(unique_urls):
+            f.write(unique_url + "\n")
+
+    # Optional live count file
+    with open("unique_pages_count.txt", "w", encoding="utf-8") as f:
+        f.write(str(len(unique_urls)) + "\n")
