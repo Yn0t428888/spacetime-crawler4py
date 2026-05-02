@@ -1,4 +1,6 @@
 import re
+import json
+from collections import Counter
 from urllib.parse import urlparse, urljoin, urldefrag, parse_qs
 
 from bs4 import BeautifulSoup
@@ -16,8 +18,29 @@ ALLOWED_PREFIXES = {
 
 UNIQUE_PAGES_FILE = "unique_pages.txt"
 
+REPORT_DATA_FILE = "report_data.json"
+REPORT_SUMMARY_FILE = "report_summary.txt"
+
+STOP_WORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an",
+    "and", "any", "are", "as", "at", "be", "because", "been", "before",
+    "being", "below", "between", "both", "but", "by", "can", "did", "do",
+    "does", "doing", "down", "during", "each", "few", "for", "from",
+    "further", "had", "has", "have", "having", "he", "her", "here",
+    "hers", "herself", "him", "himself", "his", "how", "i", "if", "in",
+    "into", "is", "it", "its", "itself", "just", "me", "more", "most",
+    "my", "myself", "no", "nor", "not", "now", "of", "off", "on",
+    "once", "only", "or", "other", "our", "ours", "ourselves", "out",
+    "over", "own", "same", "she", "should", "so", "some", "such",
+    "than", "that", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "these", "they", "this", "those", "through", "to",
+    "too", "under", "until", "up", "very", "was", "we", "were", "what",
+    "when", "where", "which", "while", "who", "whom", "why", "will",
+    "with", "you", "your", "yours", "yourself", "yourselves"
+}
+
 def scraper(url, resp):
-    record_unique_page(url, resp)
+    update_report(url, resp)
 
     links = extract_next_links(url, resp)
 
@@ -270,17 +293,15 @@ def is_valid(url):
     except (TypeError, ValueError):
         return False
 
-def record_unique_page(url, resp):
+def update_report(url, resp):
     """
-    Records each successfully crawled unique page.
+    Updates report_data.json and report_summary.txt after each successfully crawled page.
 
-    Uniqueness is based only on the URL after removing the fragment.
-    Example:
-    http://www.ics.uci.edu#aaa
-    http://www.ics.uci.edu#bbb
-
-    Both count as:
-    http://www.ics.uci.edu
+    Tracks:
+    1. Unique pages found
+    2. Longest page by word count
+    3. Top 50 most common words, ignoring stop words
+    4. Subdomains in uci.edu and unique page count per subdomain
     """
     if resp is None:
         return
@@ -294,42 +315,197 @@ def record_unique_page(url, resp):
     if resp.raw_response.content is None:
         return
 
-    if len(resp.raw_response.content) == 0:
+    content = resp.raw_response.content
+
+    if len(content) == 0:
         return
 
     final_url = resp.raw_response.url if resp.raw_response.url else url
 
-    # Remove fragment
+    # Assignment says uniqueness ignores fragments
     final_url, _ = urldefrag(final_url)
     final_url = final_url.strip()
 
     if not final_url:
         return
 
-    # Only count pages that your crawler considers valid
     if not is_valid(final_url):
         return
 
-    # Load existing unique URLs
-    unique_urls = set()
+    try:
+        soup = BeautifulSoup(content, "lxml")
+    except Exception:
+        try:
+            soup = BeautifulSoup(content, "html.parser")
+        except Exception:
+            return
+
+    # Remove non-visible or low-value text
+    for bad_tag in soup(["script", "style", "noscript"]):
+        bad_tag.decompose()
+
+    text = soup.get_text(separator=" ")
+
+    all_words = extract_all_words(text)
+    filtered_words = remove_stop_words(all_words)
+
+    # Skip pages with almost no text
+    if len(all_words) < 5:
+        return
+
+    data = load_report_data()
+
+    # If this exact defragmented URL was already counted, skip it
+    if final_url in data["unique_urls"]:
+        write_report_summary(data)
+        return
+
+    # 1. Unique pages
+    data["unique_urls"].append(final_url)
+
+    # 2. Longest page by total word count, before stop-word removal
+    word_count = len(all_words)
+
+    if word_count > data["longest_page"]["word_count"]:
+        data["longest_page"] = {
+            "url": final_url,
+            "word_count": word_count
+        }
+
+    # 3. Most common words, after stop-word removal
+    word_counter = Counter(data["word_counts"])
+    word_counter.update(filtered_words)
+    data["word_counts"] = dict(word_counter)
+
+    # 4. Subdomain counts
+    subdomain = get_subdomain(final_url)
+
+    if subdomain is not None:
+        if subdomain not in data["subdomains"]:
+            data["subdomains"][subdomain] = []
+
+        data["subdomains"][subdomain].append(final_url)
+
+    save_report_data(data)
+    write_report_summary(data)
+
+def extract_all_words(text):
+    """
+    Extracts words from visible page text.
+    HTML markup does not count because BeautifulSoup already removed it.
+    """
+    return re.findall(r"[a-zA-Z]+", text.lower())
+
+
+def remove_stop_words(words):
+    """
+    Removes stop words and one-letter words.
+    """
+    filtered_words = []
+
+    for word in words:
+        if len(word) <= 1:
+            continue
+
+        if word in STOP_WORDS:
+            continue
+
+        filtered_words.append(word)
+
+    return filtered_words
+
+def load_report_data():
+    """
+    Loads report data from disk.
+    If the file does not exist yet, creates a fresh structure.
+    """
+    default_data = {
+        "unique_urls": [],
+        "longest_page": {
+            "url": "",
+            "word_count": 0
+        },
+        "word_counts": {},
+        "subdomains": {}
+    }
 
     try:
-        with open(UNIQUE_PAGES_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                existing_url = line.strip()
-                if existing_url:
-                    unique_urls.add(existing_url)
+        with open(REPORT_DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
     except FileNotFoundError:
-        pass
+        return default_data
+    except json.JSONDecodeError:
+        return default_data
 
-    # Add current page
-    unique_urls.add(final_url)
+    for key in default_data:
+        if key not in data:
+            data[key] = default_data[key]
 
-    # Rewrite file in sorted order so it stays clean
-    with open(UNIQUE_PAGES_FILE, "w", encoding="utf-8") as f:
-        for unique_url in sorted(unique_urls):
-            f.write(unique_url + "\n")
+    return data
 
-    # Optional live count file
-    with open("unique_pages_count.txt", "w", encoding="utf-8") as f:
-        f.write(str(len(unique_urls)) + "\n")
+
+def save_report_data(data):
+    """
+    Saves the report data to disk.
+    """
+    with open(REPORT_DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def get_subdomain(url):
+    """
+    Returns the normalized uci.edu subdomain.
+
+    Example:
+    https://vision.ics.uci.edu/page
+    becomes:
+    vision.ics.uci.edu
+    """
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    if domain.endswith("uci.edu"):
+        return domain
+
+    return None
+
+def write_report_summary(data):
+    """
+    Writes the current report answers to report_summary.txt.
+    This file is rewritten after each new unique page is processed.
+    """
+    unique_urls = set(data["unique_urls"])
+
+    word_counter = Counter(data["word_counts"])
+    top_50_words = word_counter.most_common(50)
+
+    subdomain_counts = {}
+
+    for subdomain, urls in data["subdomains"].items():
+        unique_subdomain_urls = set(urls)
+        subdomain_counts[subdomain] = len(unique_subdomain_urls)
+
+    with open(REPORT_SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write("Crawler Report Summary\n")
+        f.write("======================\n\n")
+
+        f.write("1. How many unique pages did you find?\n")
+        f.write(str(len(unique_urls)) + "\n\n")
+
+        f.write("2. What is the longest page in terms of the number of words?\n")
+        f.write("URL: " + data["longest_page"]["url"] + "\n")
+        f.write("Word count: " + str(data["longest_page"]["word_count"]) + "\n\n")
+
+        f.write("3. What are the 50 most common words in the entire set of pages crawled?\n")
+        for word, count in top_50_words:
+            f.write(word + ", " + str(count) + "\n")
+
+        f.write("\n")
+
+        f.write("4. How many subdomains did you find in the uci.edu domain?\n")
+        f.write("Total subdomains: " + str(len(subdomain_counts)) + "\n\n")
+
+        for subdomain in sorted(subdomain_counts):
+            f.write(subdomain + ", " + str(subdomain_counts[subdomain]) + "\n")
