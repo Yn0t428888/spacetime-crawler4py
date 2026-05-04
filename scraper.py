@@ -140,7 +140,7 @@ def is_valid(url):
         if domain.startswith("www."):
             domain = domain[4:]
 
-        # Allowed domains
+        #allowed domains
 
         allowed = False
 
@@ -159,9 +159,8 @@ def is_valid(url):
 
         #known traps
 
-        #Calendar/event traps
 
-        #Use /events/ instead of /event/ because /event/
+        #/events/
         if "/events/" in path or path.endswith("/events"):
             return False
 
@@ -180,7 +179,7 @@ def is_valid(url):
         if domain == "ics.uci.edu" and path.startswith("/~eppstein/pix"):
             return False
 
-        #specific known trap
+        #fano
         if domain == "fano.ics.uci.edu" and path.startswith("/ca/rules"):
             return False
 
